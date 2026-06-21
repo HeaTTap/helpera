@@ -18,6 +18,9 @@ import android.view.ViewGroup
 import android.view.TextureView
 import android.view.WindowManager
 import android.widget.Toast
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.Session
+import com.jcraft.jsch.ChannelSftp
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -414,6 +417,9 @@ fun CameraTimeLapseScreen(
                         photoCount++
                         lastPhotoPath = output.savedUri?.toString() ?: "DCIM/Camera/$displayName.jpg"
                         Log.d("CameraApp", "Photo captured successfully to MediaStore: $lastPhotoPath")
+                        output.savedUri?.let { uri ->
+                            uploadPhotoToSsh(context, uri, "${displayName}.jpg")
+                        }
                     }
                 }
             )
@@ -606,6 +612,68 @@ private fun findTextureView(view: View): TextureView? {
         }
     }
     return null
+}
+
+private fun uploadPhotoToSsh(context: Context, uri: android.net.Uri, fileName: String) {
+    CoroutineScope(Dispatchers.IO).launch {
+        var session: Session? = null
+        var channel: ChannelSftp? = null
+        try {
+            val jsch = JSch()
+            session = jsch.getSession("heatlub", "192.168.0.139", 22)
+            session.setPassword("prosperloves3!")
+            
+            val config = java.util.Properties()
+            config["StrictHostKeyChecking"] = "no"
+            session.setConfig(config)
+            
+            session.connect(10000)
+            
+            val channelSftp = session.openChannel("sftp") as ChannelSftp
+            channelSftp.connect(5000)
+            channel = channelSftp
+            
+            try {
+                channelSftp.cd("/mnt/S512GB/fotoauto")
+            } catch (e: Exception) {
+                Log.w("CameraApp", "Could not cd to /mnt/S512GB/fotoauto, trying to create it", e)
+                createDirectoryRecursive(channelSftp, "/mnt/S512GB/fotoauto")
+                channelSftp.cd("/mnt/S512GB/fotoauto")
+            }
+            
+            val inputStream = context.contentResolver.openInputStream(uri)
+            if (inputStream != null) {
+                inputStream.use { stream ->
+                    channelSftp.put(stream, fileName)
+                }
+                Log.i("CameraApp", "Successfully uploaded $fileName to SSH")
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(context, "Uploaded $fileName to SSH", Toast.LENGTH_SHORT).show()
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("CameraApp", "SSH Upload failed", e)
+            withContext(Dispatchers.Main) {
+                Toast.makeText(context, "SSH Upload failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+            }
+        } finally {
+            channel?.disconnect()
+            session?.disconnect()
+        }
+    }
+}
+
+private fun createDirectoryRecursive(sftp: ChannelSftp, path: String) {
+    val dirs = path.split("/").filter { it.isNotEmpty() }
+    var currentPath = ""
+    for (dir in dirs) {
+        currentPath += "/$dir"
+        try {
+            sftp.mkdir(currentPath)
+        } catch (e: Exception) {
+            // Already exists or parent permission issue
+        }
+    }
 }
 
 data class ClientConfig(val width: Int, val height: Int)
