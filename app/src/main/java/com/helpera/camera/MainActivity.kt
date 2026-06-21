@@ -659,8 +659,8 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
             
             // Basic HTTP router
             if (requestLine.startsWith("GET /stream")) {
-                val width = parseQueryParam(requestLine, "width")?.toIntOrNull() ?: 640
-                val height = parseQueryParam(requestLine, "height")?.toIntOrNull() ?: 480
+                val width = parseQueryParam(requestLine, "width")?.toIntOrNull() ?: 1920
+                val height = parseQueryParam(requestLine, "height")?.toIntOrNull() ?: 1080
                 
                 val outputStream = socket.getOutputStream()
                 outputStream.write(
@@ -903,8 +903,8 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
                         <div class="control-item">
                             <label for="aspect-ratio">Aspect Ratio</label>
                             <select id="aspect-ratio" onchange="onRatioChange()">
-                                <option value="4:3" selected>Standard (4:3)</option>
-                                <option value="16:9">Widescreen (16:9)</option>
+                                <option value="16:9" selected>Widescreen (16:9)</option>
+                                <option value="4:3">Standard (4:3)</option>
                                 <option value="1:1">Square (1:1)</option>
                                 <option value="native">Native (Phone Screen)</option>
                             </select>
@@ -936,9 +936,9 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
                         { label: 'High (1024x768)', w: 1024, h: 768 }
                     ],
                     '16:9': [
-                        { label: 'Low (426x240)', w: 426, h: 240 },
-                        { label: 'Medium (640x360)', w: 640, h: 360, default: true },
-                        { label: 'High (1280x720)', w: 1280, h: 720 }
+                        { label: 'Low (640x360)', w: 640, h: 360 },
+                        { label: 'Medium (1280x720)', w: 1280, h: 720 },
+                        { label: 'Full HD (1920x1080)', w: 1920, h: 1080, default: true }
                     ],
                     '1:1': [
                         { label: 'Low (240x240)', w: 240, h: 240 },
