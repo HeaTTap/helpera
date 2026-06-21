@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.content.ContentValues
+import android.graphics.Bitmap
 import android.graphics.ImageFormat
 import android.graphics.Rect
 import android.graphics.YuvImage
@@ -211,69 +212,73 @@ fun CameraTimeLapseScreen(
     var photoCount by remember { mutableStateOf(0) }
     var lastPhotoPath by remember { mutableStateOf<String?>(null) }
     var captureJob by remember { mutableStateOf<Job?>(null) }
+    var streamJob by remember { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
 
-    // Camera state
-    var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
-    val previewView = remember { PreviewView(context) }
-
-    LaunchedEffect(isPermissionGranted) {
-        if (isPermissionGranted) {
-            cameraProvider = context.getCameraProvider()
+    // Camera state - created once with COMPATIBLE mode to guarantee TextureView and getBitmap() support
+    val previewView = remember { 
+        PreviewView(context).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         }
     }
 
-    LaunchedEffect(cameraProvider, isStreaming, isPermissionGranted) {
-        val provider = cameraProvider
-        if (provider != null && isPermissionGranted) {
-            val preview = Preview.Builder().build().also {
-                it.setSurfaceProvider(previewView.surfaceProvider)
-            }
+    LaunchedEffect(isPermissionGranted) {
+        if (isPermissionGranted) {
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+            cameraProviderFuture.addListener({
+                val cameraProvider = cameraProviderFuture.get()
+                
+                val preview = Preview.Builder().build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
 
-            val imageCapture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
-                .build()
-            setImageCapture(imageCapture)
+                val imageCapture = ImageCapture.Builder()
+                    .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .build()
+                setImageCapture(imageCapture)
 
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
-            try {
-                provider.unbindAll()
-                if (isStreaming) {
-                    val imageAnalysis = ImageAnalysis.Builder()
-                        .setTargetResolution(android.util.Size(640, 480))
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
-                        .build()
-
-                    imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-                        try {
-                            val jpegBytes = imageProxy.toJpeg()
-                            mjpegServer.broadcastFrame(jpegBytes)
-                        } catch (e: Exception) {
-                            Log.e("CameraApp", "Error in analyzer", e)
-                        } finally {
-                            imageProxy.close()
-                        }
-                    }
-
-                    provider.bindToLifecycle(
-                        lifecycleOwner,
-                        cameraSelector,
-                        preview,
-                        imageAnalysis
-                    )
-                } else {
-                    provider.bindToLifecycle(
+                try {
+                    cameraProvider.unbindAll()
+                    cameraProvider.bindToLifecycle(
                         lifecycleOwner,
                         cameraSelector,
                         preview,
                         imageCapture
                     )
+                } catch (exc: Exception) {
+                    Log.e("CameraApp", "Use case binding failed", exc)
                 }
-            } catch (exc: Exception) {
-                Log.e("CameraApp", "Use case binding failed", exc)
+            }, ContextCompat.getMainExecutor(context))
+        }
+    }
+
+    // Handle streaming loop by pulling bitmaps directly from the working PreviewView
+    LaunchedEffect(isStreaming) {
+        if (isStreaming) {
+            streamJob = scope.launch(Dispatchers.Main) {
+                while (isActive) {
+                    val bitmap = previewView.bitmap
+                    if (bitmap != null) {
+                        withContext(Dispatchers.IO) {
+                            try {
+                                val out = ByteArrayOutputStream()
+                                bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                                val jpegBytes = out.toByteArray()
+                                mjpegServer.broadcastFrame(jpegBytes)
+                            } catch (e: Exception) {
+                                Log.e("CameraApp", "Error encoding/broadcasting frame", e)
+                            }
+                        }
+                        bitmap.recycle() // Prevent native memory leaks!
+                    }
+                    delay(100) // ~10 FPS
+                }
             }
+        } else {
+            streamJob?.cancel()
+            streamJob = null
         }
     }
 
@@ -487,91 +492,6 @@ fun CameraTimeLapseScreen(
             }
         }
     }
-}
-
-// Extension and Helper functions for Camera and Server
-suspend fun Context.getCameraProvider(): ProcessCameraProvider = suspendCancellableCoroutine { continuation ->
-    val future = ProcessCameraProvider.getInstance(this)
-    future.addListener({
-        try {
-            continuation.resume(future.get())
-        } catch (e: Exception) {
-            continuation.resumeWithException(e)
-        }
-    }, ContextCompat.getMainExecutor(this))
-}
-
-fun ImageProxy.toNv21(): ByteArray {
-    val yPlane = planes[0]
-    val uPlane = planes[1]
-    val vPlane = planes[2]
-
-    val yBuffer = yPlane.buffer
-    val uBuffer = uPlane.buffer
-    val vBuffer = vPlane.buffer
-
-    yBuffer.rewind()
-    uBuffer.rewind()
-    vBuffer.rewind()
-
-    val ySize = yBuffer.remaining()
-    val uSize = uBuffer.remaining()
-    val vSize = vBuffer.remaining()
-
-    val nv21 = ByteArray(width * height * 3 / 2)
-
-    // Copy Y plane
-    var nv21Idx = 0
-    val yRowStride = yPlane.rowStride
-    val yPixelStride = yPlane.pixelStride
-    
-    if (yPixelStride == 1 && yRowStride == width) {
-        yBuffer.get(nv21, 0, ySize)
-        nv21Idx = ySize
-    } else {
-        val rowBuffer = ByteArray(yRowStride)
-        for (row in 0 until height) {
-            yBuffer.position(row * yRowStride)
-            if (row == height - 1) {
-                yBuffer.get(nv21, nv21Idx, width)
-            } else {
-                yBuffer.get(rowBuffer, 0, yRowStride)
-                System.arraycopy(rowBuffer, 0, nv21, nv21Idx, width)
-            }
-            nv21Idx += width
-        }
-    }
-
-    // Interleave U and V planes (NV21 has V then U)
-    val uRowStride = uPlane.rowStride
-    val vRowStride = vPlane.rowStride
-    val uPixelStride = uPlane.pixelStride
-    val vPixelStride = vPlane.pixelStride
-
-    val uvWidth = width / 2
-    val uvHeight = height / 2
-
-    for (row in 0 until uvHeight) {
-        val uRowPos = row * uRowStride
-        val vRowPos = row * vRowStride
-        for (col in 0 until uvWidth) {
-            val uPos = uRowPos + col * uPixelStride
-            val vPos = vRowPos + col * vPixelStride
-
-            // NV21 format: V, U, V, U...
-            nv21[nv21Idx++] = vBuffer.get(vPos)
-            nv21[nv21Idx++] = uBuffer.get(uPos)
-        }
-    }
-    return nv21
-}
-
-fun ImageProxy.toJpeg(): ByteArray {
-    val nv21 = this.toNv21()
-    val yuvImage = YuvImage(nv21, ImageFormat.NV21, this.width, this.height, null)
-    val out = ByteArrayOutputStream()
-    yuvImage.compressToJpeg(Rect(0, 0, this.width, this.height), 70, out)
-    return out.toByteArray()
 }
 
 class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) {
