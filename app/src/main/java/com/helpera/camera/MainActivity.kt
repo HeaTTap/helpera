@@ -287,6 +287,7 @@ fun CameraTimeLapseScreen(
                 if (textureView != null) {
                     // Cache of reusable bitmaps for each active resolution to avoid memory churn
                     val bitmapCache = mutableMapOf<Pair<Int, Int>, Bitmap>()
+                    val isCompressing = ConcurrentHashMap<Pair<Int, Int>, Boolean>()
 
                     try {
                         while (isActive) {
@@ -304,8 +305,12 @@ fun CameraTimeLapseScreen(
                                 while (iterator.hasNext()) {
                                     val entry = iterator.next()
                                     if (entry.key !in activeResolutions) {
-                                        entry.value.recycle()
-                                        iterator.remove()
+                                        // Wait until active background compression completes to avoid recycling busy bitmaps
+                                        if (isCompressing[entry.key] != true) {
+                                            entry.value.recycle()
+                                            isCompressing.remove(entry.key)
+                                            iterator.remove()
+                                        }
                                     }
                                 }
 
@@ -321,20 +326,36 @@ fun CameraTimeLapseScreen(
                                 }
 
                                 // Capture and broadcast for each active resolution
-                                for ((res, bitmap) in bitmapCache) {
+                                for (res in activeResolutions) {
+                                    val bitmap = bitmapCache[res] ?: continue
+                                    
+                                    // Skip capturing this frame if background thread is still compressing previous one (non-blocking drop frame)
+                                    if (isCompressing[res] == true) {
+                                        continue
+                                    }
+
                                     try {
                                         // Scale frame into cached bitmap on UI thread (extremely fast due to GPU scaling)
                                         textureView.getBitmap(bitmap)
 
-                                        // Compress to JPEG and broadcast on background thread
-                                        withContext(Dispatchers.IO) {
-                                            val out = ByteArrayOutputStream()
-                                            bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
-                                            val jpegBytes = out.toByteArray()
-                                            mjpegServer.broadcastFrame(nativeWidth, nativeHeight, res.first, res.second, jpegBytes)
+                                        isCompressing[res] = true
+
+                                        // Compress to JPEG and broadcast on background thread (non-blocking)
+                                        scope.launch(Dispatchers.IO) {
+                                            try {
+                                                val out = ByteArrayOutputStream()
+                                                bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                                                val jpegBytes = out.toByteArray()
+                                                mjpegServer.broadcastFrame(nativeWidth, nativeHeight, res.first, res.second, jpegBytes)
+                                            } catch (e: Exception) {
+                                                Log.e("CameraApp", "Error compressing frame for resolution ${res.first}x${res.second}", e)
+                                            } finally {
+                                                isCompressing[res] = false
+                                            }
                                         }
                                     } catch (e: Exception) {
-                                        Log.e("CameraApp", "Streaming loop frame capture/broadcast error", e)
+                                        Log.e("CameraApp", "Streaming loop frame capture error", e)
+                                        isCompressing[res] = false
                                     }
                                 }
                             }
@@ -349,6 +370,7 @@ fun CameraTimeLapseScreen(
                             bitmap.recycle()
                         }
                         bitmapCache.clear()
+                        isCompressing.clear()
                     }
                 }
             }
