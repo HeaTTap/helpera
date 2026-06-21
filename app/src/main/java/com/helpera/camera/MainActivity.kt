@@ -285,29 +285,57 @@ fun CameraTimeLapseScreen(
                 }
 
                 if (textureView != null) {
-                    // Preallocate scaled bitmap to avoid memory churn and GC pauses (640x480 targets ~30 FPS)
-                    val targetWidth = 640
-                    val targetHeight = 480
-                    val reuseBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                    // Cache of reusable bitmaps for each active resolution to avoid memory churn
+                    val bitmapCache = mutableMapOf<Pair<Int, Int>, Bitmap>()
 
                     try {
                         while (isActive) {
                             val startTime = System.currentTimeMillis()
 
-                            if (textureView.isAvailable) {
-                                try {
-                                    // Scale frame into preallocated bitmap on UI thread (extremely fast due to GPU scaling)
-                                    textureView.getBitmap(reuseBitmap)
+                            // Get native TextureView dimensions safely (fallback to 640x480 if not laid out yet)
+                            val nativeWidth = if (textureView.width > 0) textureView.width else 640
+                            val nativeHeight = if (textureView.height > 0) textureView.height else 480
 
-                                    // Compress to JPEG and broadcast on background thread
-                                    withContext(Dispatchers.IO) {
-                                        val out = ByteArrayOutputStream()
-                                        reuseBitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
-                                        val jpegBytes = out.toByteArray()
-                                        mjpegServer.broadcastFrame(jpegBytes)
+                            val activeResolutions = mjpegServer.getUniqueClientResolutions(nativeWidth, nativeHeight)
+
+                            if (activeResolutions.isNotEmpty() && textureView.isAvailable) {
+                                // Recycle and remove bitmaps for resolutions that are no longer active
+                                val iterator = bitmapCache.iterator()
+                                while (iterator.hasNext()) {
+                                    val entry = iterator.next()
+                                    if (entry.key !in activeResolutions) {
+                                        entry.value.recycle()
+                                        iterator.remove()
                                     }
-                                } catch (e: Exception) {
-                                    Log.e("CameraApp", "Streaming loop frame capture/broadcast error", e)
+                                }
+
+                                // Create bitmaps for new active resolutions
+                                for (res in activeResolutions) {
+                                    if (res !in bitmapCache) {
+                                        try {
+                                            bitmapCache[res] = Bitmap.createBitmap(res.first, res.second, Bitmap.Config.ARGB_8888)
+                                        } catch (e: OutOfMemoryError) {
+                                            Log.e("CameraApp", "OOM creating bitmap for ${res.first}x${res.second}", e)
+                                        }
+                                    }
+                                }
+
+                                // Capture and broadcast for each active resolution
+                                for ((res, bitmap) in bitmapCache) {
+                                    try {
+                                        // Scale frame into cached bitmap on UI thread (extremely fast due to GPU scaling)
+                                        textureView.getBitmap(bitmap)
+
+                                        // Compress to JPEG and broadcast on background thread
+                                        withContext(Dispatchers.IO) {
+                                            val out = ByteArrayOutputStream()
+                                            bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                                            val jpegBytes = out.toByteArray()
+                                            mjpegServer.broadcastFrame(nativeWidth, nativeHeight, res.first, res.second, jpegBytes)
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.e("CameraApp", "Streaming loop frame capture/broadcast error", e)
+                                    }
                                 }
                             }
 
@@ -317,7 +345,10 @@ fun CameraTimeLapseScreen(
                             delay(delayMs)
                         }
                     } finally {
-                        reuseBitmap.recycle()
+                        for (bitmap in bitmapCache.values) {
+                            bitmap.recycle()
+                        }
+                        bitmapCache.clear()
                     }
                 }
             }
@@ -555,10 +586,28 @@ private fun findTextureView(view: View): TextureView? {
     return null
 }
 
+data class ClientConfig(val width: Int, val height: Int)
+
+private fun parseQueryParam(requestLine: String, key: String): String? {
+    val queryStart = requestLine.indexOf('?')
+    if (queryStart == -1) return null
+    val spaceEnd = requestLine.indexOf(' ', queryStart)
+    if (spaceEnd == -1) return null
+    val queryString = requestLine.substring(queryStart + 1, spaceEnd)
+    val pairs = queryString.split('&')
+    for (pair in pairs) {
+        val parts = pair.split('=')
+        if (parts.size == 2 && parts[0] == key) {
+            return parts[1]
+        }
+    }
+    return null
+}
+
 class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) {
     private var serverSocket: ServerSocket? = null
     private var isRunning = false
-    private val clients = Collections.newSetFromMap(ConcurrentHashMap<Socket, Boolean>())
+    private val clients = ConcurrentHashMap<Socket, ClientConfig>()
     private var thread: Thread? = null
 
     fun start() {
@@ -590,7 +639,7 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
             Log.e("MjpegServer", "Error closing server socket", e)
         }
         serverSocket = null
-        for (client in clients) {
+        for (client in clients.keys) {
             try {
                 client.close()
             } catch (e: IOException) {
@@ -610,6 +659,9 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
             
             // Basic HTTP router
             if (requestLine.startsWith("GET /stream")) {
+                val width = parseQueryParam(requestLine, "width")?.toIntOrNull() ?: 640
+                val height = parseQueryParam(requestLine, "height")?.toIntOrNull() ?: 480
+                
                 val outputStream = socket.getOutputStream()
                 outputStream.write(
                     ("HTTP/1.1 200 OK\r\n" +
@@ -619,7 +671,7 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
                      "Connection: keep-alive\r\n\r\n").toByteArray()
                 )
                 outputStream.flush()
-                clients.add(socket)
+                clients[socket] = ClientConfig(width, height)
                 
                 // Keep reading from socket to detect client disconnects
                 while (isRunning && !socket.isClosed) {
@@ -655,27 +707,44 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
         }
     }
 
-    fun broadcastFrame(jpegBytes: ByteArray) {
+    fun getUniqueClientResolutions(nativeWidth: Int, nativeHeight: Int): List<Pair<Int, Int>> {
+        val resolutions = mutableSetOf<Pair<Int, Int>>()
+        for (config in clients.values) {
+            val w = if (config.width <= 0) nativeWidth else config.width
+            val h = if (config.height <= 0) nativeHeight else config.height
+            if (w > 0 && h > 0) {
+                resolutions.add(Pair(w, h))
+            }
+        }
+        return resolutions.toList()
+    }
+
+    fun broadcastFrame(nativeWidth: Int, nativeHeight: Int, width: Int, height: Int, jpegBytes: ByteArray) {
         if (clients.isEmpty()) return
         
         val boundary = "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpegBytes.size}\r\n\r\n".toByteArray()
         val endBoundary = "\r\n".toByteArray()
         
-        val iterator = clients.iterator()
+        val iterator = clients.entries.iterator()
         while (iterator.hasNext()) {
-            val client = iterator.next()
-            try {
-                val out = client.getOutputStream()
-                out.write(boundary)
-                out.write(jpegBytes)
-                out.write(endBoundary)
-                out.flush()
-            } catch (e: IOException) {
-                // Client disconnected
-                iterator.remove()
+            val entry = iterator.next()
+            val socket = entry.key
+            val config = entry.value
+            val cw = if (config.width <= 0) nativeWidth else config.width
+            val ch = if (config.height <= 0) nativeHeight else config.height
+            if (cw == width && ch == height) {
                 try {
-                    client.close()
-                } catch (ex: Exception) {}
+                    val out = socket.getOutputStream()
+                    out.write(boundary)
+                    out.write(jpegBytes)
+                    out.write(endBoundary)
+                    out.flush()
+                } catch (e: IOException) {
+                    iterator.remove()
+                    try {
+                        socket.close()
+                    } catch (ex: Exception) {}
+                }
             }
         }
     }
@@ -690,9 +759,9 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
             <style>
                 body {
                     margin: 0;
-                    background: #121212;
-                    color: #ffffff;
-                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+                    background: #0f0f11;
+                    color: #f3f4f6;
+                    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
                     display: flex;
                     flex-direction: column;
                     align-items: center;
@@ -701,82 +770,227 @@ class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) 
                 }
                 .container {
                     text-align: center;
-                    padding: 20px;
-                    max-width: 100%;
+                    padding: 24px;
+                    max-width: 680px;
+                    width: 100%;
+                    box-sizing: border-box;
                 }
                 h1 {
-                    font-size: 24px;
-                    margin-bottom: 5px;
-                    font-weight: 600;
+                    font-size: 26px;
+                    margin: 0 0 4px 0;
+                    font-weight: 700;
                     color: #00e676;
-                    letter-spacing: 0.5px;
+                    letter-spacing: -0.5px;
                 }
-                p {
-                    color: #888;
+                p.subtitle {
+                    color: #9ca3af;
                     font-size: 14px;
-                    margin-top: 0;
-                    margin-bottom: 20px;
+                    margin: 0 0 24px 0;
+                    font-weight: 500;
                 }
                 .stream-wrapper {
                     position: relative;
                     background: #000;
-                    border-radius: 12px;
+                    border-radius: 16px;
                     overflow: hidden;
-                    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
-                    display: inline-block;
+                    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
                     line-height: 0;
-                    padding: 10px;
+                    padding: 8px;
+                    border: 1px solid rgba(255, 255, 255, 0.05);
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
                 }
                 .stream-img {
                     max-width: 100%;
-                    max-height: 70vh;
-                    border-radius: 8px;
+                    max-height: 60vh;
+                    border-radius: 10px;
                     transform: rotate(${defaultRotation}deg);
-                    transition: transform 0.3s ease;
+                    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease;
+                    opacity: 1;
                 }
-                .controls {
-                    margin-top: 20px;
+                .control-panel {
+                    background: rgba(255, 255, 255, 0.02);
+                    border: 1px solid rgba(255, 255, 255, 0.06);
+                    border-radius: 16px;
+                    padding: 20px;
+                    margin-top: 24px;
                     display: flex;
-                    gap: 10px;
+                    flex-direction: column;
+                    gap: 20px;
+                    backdrop-filter: blur(12px);
+                }
+                .settings-row {
+                    display: flex;
+                    gap: 16px;
                     justify-content: center;
                     flex-wrap: wrap;
                 }
-                button {
-                    background: #222;
-                    color: #fff;
-                    border: 1px solid #444;
-                    padding: 10px 20px;
-                    border-radius: 6px;
+                .control-item {
+                    display: flex;
+                    flex-direction: column;
+                    align-items: flex-start;
+                    gap: 6px;
+                    flex: 1;
+                    min-width: 160px;
+                }
+                .control-item label {
+                    font-size: 11px;
+                    color: #9ca3af;
+                    text-transform: uppercase;
+                    letter-spacing: 1px;
+                    font-weight: 700;
+                }
+                select {
+                    background: #18181b;
+                    color: #f3f4f6;
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    padding: 10px 14px;
+                    border-radius: 8px;
                     cursor: pointer;
                     font-size: 14px;
                     font-weight: 500;
-                    transition: all 0.2s;
+                    width: 100%;
+                    outline: none;
+                    transition: all 0.2s ease;
+                    box-sizing: border-box;
+                }
+                select:focus {
+                    border-color: #00e676;
+                    box-shadow: 0 0 0 3px rgba(0, 230, 118, 0.15);
+                }
+                .btn-group {
+                    display: flex;
+                    gap: 8px;
+                    justify-content: center;
+                    flex-wrap: wrap;
+                    border-top: 1px solid rgba(255, 255, 255, 0.05);
+                    padding-top: 16px;
+                }
+                button {
+                    background: #18181b;
+                    color: #f3f4f6;
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    padding: 8px 16px;
+                    border-radius: 8px;
+                    cursor: pointer;
+                    font-size: 13px;
+                    font-weight: 600;
+                    transition: all 0.2s ease;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
                 }
                 button:hover {
-                    background: #333;
+                    background: rgba(255, 255, 255, 0.05);
                     border-color: #00e676;
+                    color: #00e676;
+                }
+                button:active {
+                    transform: scale(0.97);
                 }
             </style>
         </head>
         <body>
             <div class="container">
                 <h1>Helpera IP Camera</h1>
-                <p>Live Video Stream</p>
+                <p class="subtitle">Live Video Stream</p>
                 <div class="stream-wrapper">
                     <img src="/stream" class="stream-img" alt="Live Feed">
                 </div>
-                <div class="controls">
-                    <button onclick="rotate(0)">Rotate 0&deg;</button>
-                    <button onclick="rotate(90)">Rotate 90&deg;</button>
-                    <button onclick="rotate(180)">Rotate 180&deg;</button>
-                    <button onclick="rotate(270)">Rotate 270&deg;</button>
+                <div class="control-panel">
+                    <div class="settings-row">
+                        <div class="control-item">
+                            <label for="aspect-ratio">Aspect Ratio</label>
+                            <select id="aspect-ratio" onchange="onRatioChange()">
+                                <option value="4:3" selected>Standard (4:3)</option>
+                                <option value="16:9">Widescreen (16:9)</option>
+                                <option value="1:1">Square (1:1)</option>
+                                <option value="native">Native (Phone Screen)</option>
+                            </select>
+                        </div>
+                        <div class="control-item">
+                            <label for="resolution">Resolution</label>
+                            <select id="resolution" onchange="updateStream()">
+                                <!-- Populated by JS -->
+                            </select>
+                        </div>
+                    </div>
+                    <div class="btn-group">
+                        <button onclick="rotate(0)">Rotate 0&deg;</button>
+                        <button onclick="rotate(90)">Rotate 90&deg;</button>
+                        <button onclick="rotate(180)">Rotate 180&deg;</button>
+                        <button onclick="rotate(270)">Rotate 270&deg;</button>
+                    </div>
                 </div>
             </div>
             <script>
                 const img = document.querySelector('.stream-img');
+                const ratioSelect = document.getElementById('aspect-ratio');
+                const resSelect = document.getElementById('resolution');
+
+                const resolutionsByRatio = {
+                    '4:3': [
+                        { label: 'Low (320x240)', w: 320, h: 240 },
+                        { label: 'Medium (640x480)', w: 640, h: 480, default: true },
+                        { label: 'High (1024x768)', w: 1024, h: 768 }
+                    ],
+                    '16:9': [
+                        { label: 'Low (426x240)', w: 426, h: 240 },
+                        { label: 'Medium (640x360)', w: 640, h: 360, default: true },
+                        { label: 'High (1280x720)', w: 1280, h: 720 }
+                    ],
+                    '1:1': [
+                        { label: 'Low (240x240)', w: 240, h: 240 },
+                        { label: 'Medium (480x480)', w: 480, h: 480, default: true },
+                        { label: 'High (720x720)', w: 720, h: 720 }
+                    ],
+                    'native': [
+                        { label: 'Native (0x0)', w: 0, h: 0, default: true }
+                    ]
+                };
+
+                function onRatioChange() {
+                    const ratio = ratioSelect.value;
+                    const options = resolutionsByRatio[ratio];
+                    
+                    resSelect.innerHTML = '';
+                    let defaultIdx = 0;
+                    
+                    options.forEach((opt, idx) => {
+                        const el = document.createElement('option');
+                        el.value = opt.w + 'x' + opt.h;
+                        el.textContent = opt.label;
+                        if (opt.default) defaultIdx = idx;
+                        resSelect.appendChild(el);
+                    });
+                    
+                    resSelect.selectedIndex = defaultIdx;
+                    updateStream();
+                }
+
+                function updateStream() {
+                    const ratio = ratioSelect.value;
+                    const selectedRes = resolutionsByRatio[ratio][resSelect.selectedIndex];
+                    
+                    // Visual transition feedback
+                    img.style.opacity = 0.4;
+                    
+                    // Build stream query url
+                    const streamUrl = '/stream?width=' + selectedRes.w + '&height=' + selectedRes.h + '&t=' + Date.now();
+                    img.src = streamUrl;
+                }
+
+                img.onload = function() {
+                    img.style.opacity = 1;
+                };
+
                 function rotate(deg) {
                     img.style.transform = 'rotate(' + deg + 'deg)';
                 }
+
+                // Initialize resolutions on load
+                onRatioChange();
             </script>
         </body>
         </html>
