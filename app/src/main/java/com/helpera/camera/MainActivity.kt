@@ -13,6 +13,9 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import android.view.View
+import android.view.ViewGroup
+import android.view.TextureView
 import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -212,6 +215,7 @@ fun CameraTimeLapseScreen(
     var photoCount by remember { mutableStateOf(0) }
     var lastPhotoPath by remember { mutableStateOf<String?>(null) }
     var captureJob by remember { mutableStateOf<Job?>(null) }
+    var streamJob by remember { mutableStateOf<Job?>(null) }
     val scope = rememberCoroutineScope()
 
     // 1. Create camera use case instances once using remember
@@ -221,16 +225,13 @@ fun CameraTimeLapseScreen(
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
             .build()
     }
-    val imageAnalysis = remember {
-        ImageAnalysis.Builder()
-            .setTargetResolution(android.util.Size(640, 480))
-            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-            .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-            .build()
-    }
 
-    // Camera view - created once
-    val previewView = remember { PreviewView(context) }
+    // Camera view - forced to COMPATIBLE mode to guarantee TextureView availability
+    val previewView = remember { 
+        PreviewView(context).apply {
+            implementationMode = PreviewView.ImplementationMode.COMPATIBLE
+        }
+    }
     var cameraProvider by remember { mutableStateOf<ProcessCameraProvider?>(null) }
 
     // 2. Retrieve cameraProvider once
@@ -248,23 +249,8 @@ fun CameraTimeLapseScreen(
         setImageCapture(imageCapture)
     }
 
-    // 4. Configure analyzer once (runs on background executor, keeping UI at 60 FPS)
-    LaunchedEffect(imageAnalysis) {
-        imageAnalysis.setAnalyzer(cameraExecutor) { imageProxy ->
-            if (isStreaming) {
-                try {
-                    val jpegBytes = imageProxy.rgbaToJpeg()
-                    mjpegServer.broadcastFrame(jpegBytes)
-                } catch (e: Exception) {
-                    Log.e("CameraApp", "Error in analyzer", e)
-                }
-            }
-            imageProxy.close()
-        }
-    }
-
-    // 5. Handle lifecycle binding/unbinding when isStreaming transitions
-    LaunchedEffect(cameraProvider, isStreaming) {
+    // 4. Bind Preview and ImageCapture concurrently (never unbind/rebind during streaming to avoid flashing)
+    LaunchedEffect(cameraProvider) {
         val provider = cameraProvider
         if (provider != null) {
             try {
@@ -273,23 +259,71 @@ fun CameraTimeLapseScreen(
                 
                 preview.setSurfaceProvider(previewView.surfaceProvider)
 
-                if (isStreaming) {
-                    provider.bindToLifecycle(
-                        lifecycleOwner,
-                        cameraSelector,
-                        imageAnalysis
-                    )
-                } else {
-                    provider.bindToLifecycle(
-                        lifecycleOwner,
-                        cameraSelector,
-                        preview,
-                        imageCapture
-                    )
-                }
+                provider.bindToLifecycle(
+                    lifecycleOwner,
+                    cameraSelector,
+                    preview,
+                    imageCapture
+                )
             } catch (exc: Exception) {
                 Log.e("CameraApp", "Use case binding failed", exc)
             }
+        }
+    }
+
+    // 5. Handle streaming loop by capturing frames directly from the TextureView in PreviewView
+    LaunchedEffect(isStreaming) {
+        if (isStreaming) {
+            streamJob = scope.launch(Dispatchers.Main) {
+                // Find TextureView in the PreviewView hierarchy (polled until ready)
+                var textureView: TextureView? = null
+                while (textureView == null && isActive) {
+                    textureView = findTextureView(previewView)
+                    if (textureView == null) {
+                        delay(100)
+                    }
+                }
+
+                if (textureView != null) {
+                    // Preallocate scaled bitmap to avoid memory churn and GC pauses (640x480 targets ~30 FPS)
+                    val targetWidth = 640
+                    val targetHeight = 480
+                    val reuseBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+
+                    try {
+                        while (isActive) {
+                            val startTime = System.currentTimeMillis()
+
+                            if (textureView.isAvailable) {
+                                try {
+                                    // Scale frame into preallocated bitmap on UI thread (extremely fast due to GPU scaling)
+                                    textureView.getBitmap(reuseBitmap)
+
+                                    // Compress to JPEG and broadcast on background thread
+                                    withContext(Dispatchers.IO) {
+                                        val out = ByteArrayOutputStream()
+                                        reuseBitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
+                                        val jpegBytes = out.toByteArray()
+                                        mjpegServer.broadcastFrame(jpegBytes)
+                                    }
+                                } catch (e: Exception) {
+                                    Log.e("CameraApp", "Streaming loop frame capture/broadcast error", e)
+                                }
+                            }
+
+                            // Regulate FPS to ~30 (33 ms target)
+                            val elapsed = System.currentTimeMillis() - startTime
+                            val delayMs = (33 - elapsed).coerceAtLeast(1)
+                            delay(delayMs)
+                        }
+                    } finally {
+                        reuseBitmap.recycle()
+                    }
+                }
+            }
+        } else {
+            streamJob?.cancel()
+            streamJob = null
         }
     }
 
@@ -505,19 +539,20 @@ fun CameraTimeLapseScreen(
     }
 }
 
-// Convert RGBA ImageProxy to JPEG byte array fast
-fun ImageProxy.rgbaToJpeg(): ByteArray {
-    val plane = planes[0]
-    val buffer = plane.buffer
-    buffer.rewind()
-    
-    val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-    bitmap.copyPixelsFromBuffer(buffer)
-    
-    val out = ByteArrayOutputStream()
-    bitmap.compress(Bitmap.CompressFormat.JPEG, 70, out)
-    bitmap.recycle() // Prevent native memory leaks!
-    return out.toByteArray()
+private fun findTextureView(view: View): TextureView? {
+    if (view is TextureView) {
+        return view
+    }
+    if (view is ViewGroup) {
+        for (i in 0 until view.childCount) {
+            val child = view.getChildAt(i)
+            val result = findTextureView(child)
+            if (result != null) {
+                return result
+            }
+        }
+    }
+    return null
 }
 
 class MjpegServer(private val port: Int, private val defaultRotation: Int = 90) {
