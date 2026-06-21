@@ -261,7 +261,6 @@ fun CameraTimeLapseScreen(
                         lifecycleOwner,
                         cameraSelector,
                         preview,
-                        imageCapture,
                         imageAnalysis
                     )
                 } else {
@@ -452,9 +451,11 @@ fun CameraTimeLapseScreen(
                     ) {
                         Button(
                             onClick = { isCapturing = !isCapturing },
+                            enabled = !isStreaming,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = if (isCapturing) Color.Red else Color.Green,
-                                contentColor = Color.White
+                                contentColor = Color.White,
+                                disabledContainerColor = Color.DarkGray
                             ),
                             modifier = Modifier.weight(1f)
                         ) {
@@ -467,9 +468,11 @@ fun CameraTimeLapseScreen(
 
                         Button(
                             onClick = { onToggleStreaming(!isStreaming) },
+                            enabled = !isCapturing,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = if (isStreaming) Color.Red else Color(0xFF00B0FF),
-                                contentColor = Color.White
+                                contentColor = Color.White,
+                                disabledContainerColor = Color.DarkGray
                             ),
                             modifier = Modifier.weight(1f)
                         ) {
