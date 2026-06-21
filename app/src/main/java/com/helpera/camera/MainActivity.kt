@@ -277,7 +277,6 @@ fun CameraTimeLapseScreen(
                     provider.bindToLifecycle(
                         lifecycleOwner,
                         cameraSelector,
-                        preview,
                         imageAnalysis
                     )
                 } else {
